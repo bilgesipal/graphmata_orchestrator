@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+gunicorn
+pydantic
+azure-keyvault-secrets
+azure-identity
+python-dotenv
+google-cloud-secret-manager
+redis
+langchain
+langchain-openai
+langchain_core
+langgraph
+#langgraph.checkpoint.redis

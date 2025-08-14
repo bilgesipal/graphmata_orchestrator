@@ -1,0 +1,110 @@
+image: atlassian/default-image:3
+options:
+  size: 4x
+  runtime:
+    cloud:
+      atlassian-ip-ranges: true
+definitions:
+  caches:
+    sonar: /opt/sonar-scanner/.sonar
+  steps:
+    - step: &prepare-and-build
+        name: Prepare And Build
+        script:
+          - echo "Prepare And Build for $Deploy_Env"
+          - 'if [[ $Deploy_Env == "production" ]];
+                then 
+                    echo "Environment variables is production!";
+                    export ASPNETCORE_ENVIRONMENT="Production";
+                    export PRE_BUILD_PARAMS="DEPLOY_ENV:prod PROJECT_NAME:${APP_NAME} CPU-LIMIT:750m MEMORY-LIMIT:1500Mi CPU-REQUEST:1m MEMORY-REQUEST:1Mi MIN-REPLICAS:1 MAX-REPLICAS:1 ENV_NAME0:OPENAI_API_KEY";
+                elif [[ $Deploy_Env == "staging" ]];
+                     then
+                        echo "Environment variables is staging!" && export ASPNETCORE_ENVIRONMENT="Staging";
+                        export PRE_BUILD_PARAMS="DEPLOY_ENV:staging PROJECT_NAME:${APP_NAME} CPU-LIMIT:750m MEMORY-LIMIT:1500Mi CPU-REQUEST:1m MEMORY-REQUEST:1Mi MIN-REPLICAS:1 MAX-REPLICAS:1 ENV_NAME0:OPENAI_API_KEY";                
+                else
+                  echo "Environment variables is test!" && export ASPNETCORE_ENVIRONMENT=""; 
+                  export PRE_BUILD_PARAMS="DEPLOY_ENV:test PROJECT_NAME:${APP_NAME} CPU-LIMIT:750m MEMORY-LIMIT:1500Mi CPU-REQUEST:1m MEMORY-REQUEST:1Mi MIN-REPLICAS:1 MAX-REPLICAS:1 ENV_NAME0:OPENAI_API_KEY" && echo "$PRE_BUILD_PARAMS";
+                  export OPENAI_TOKEN_DEPLOY=${OPENAI_TOKEN};
+              fi'
+          - git clone https://${BITBUCKET_USER_ID}:${BITBUCKET_USER_PASSWORD}@bitbucket.org/erkateknoloji/build-arge.git
+          - mv build-arge/prepare-python.sh ./ && chmod +x ./prepare-python.sh && ./prepare-python.sh ${PRE_BUILD_PARAMS}
+          - export DOCKER_BUILDKIT=0
+          - docker build -t ${APP_NAME} --build-arg BUILD_NUMBER=${BITBUCKET_BUILD_NUMBER} . && docker save --output tmp-image.docker ${APP_NAME}
+          - cat ${WORKING_PATH}/build/k8s/deployment.yaml >> ./deploy.yaml && cat ${WORKING_PATH}/build/k8s/service.yaml >> ./svc.yaml && cat ${WORKING_PATH}/build/k8s/horizontalpodautoscaler.yaml >> ./hpa.yaml
+          - sed -i "s|XENV_VALUE0X.*|$OPENAI_TOKEN_DEPLOY\"|g" ./deploy.yaml
+        services:
+          - docker
+        artifacts:
+          - tmp-image.docker
+          - deploy.yaml
+          - svc.yaml
+          - hpa.yaml
+    - step: &sonarQube-python-analysis
+        name: SonarQube Python Analysis 
+        image: sonarsource/sonar-scanner-cli:latest
+        caches:
+          - pip
+          - sonar
+        script:
+          - |
+            set -e
+            if [[ "$BITBUCKET_BRANCH" == "master" ]]; then
+              echo "=== 1. Running SonarScanner ==="
+              sonar-scanner \
+                -Dsonar.projectKey=$BITBUCKET_REPO_SLUG \
+                -Dsonar.sources=. \
+                -Dsonar.language=py \
+                -Dsonar.host.url=$SONAR_HOST_URL \
+                -Dsonar.login=$SONAR_TOKEN
+            fi
+    - step: &tag-push-deploy
+        name: Tag,Push and Deploy
+        image: google/cloud-sdk:alpine
+        script:
+          - echo "Tag,Push and Deploy to $Deploy_Env" && export BRANCH=${Deploy_Env}
+          - gcloud components install kubectl --quiet
+          - 'if [[ $Deploy_Env == "production" ]];
+                then 
+                    echo "Environment variables is production!";
+                        export GCLOUD_ERKA_GCR_DEPLOY_ENV=${GCLOUD_API_KEYFILE_ERKA_GCR_PROD} && export GCLOUD_ERKA_K8S_DEPLOY_ENV=${GCLOUD_API_KEYFILE_ERKA_K8S_PROD};
+                        export ERKA_DEPLOY_ENV_PROJ_NAME=${ERKA_PROD_PROJ_NAME} && export ERKA_DEPLOY_ENV_K8S_NAME=${ERKA_PROD_K8S_NAME} && export ERKA_DEPLOY_ENV_ZONE=${ERKA_PROD_ZONE};
+                elif [[ $Deploy_Env == "staging" ]];
+                     then
+                        echo "Environment variables is staging!";
+                        export GCLOUD_ERKA_GCR_DEPLOY_ENV=${GCLOUD_API_KEYFILE_ERKA_GCR_STAGING} && export GCLOUD_ERKA_K8S_DEPLOY_ENV=${GCLOUD_API_KEYFILE_ERKA_K8S_STAGING};
+                        export ERKA_DEPLOY_ENV_PROJ_NAME=${ERKA_STAGING_PROJ_NAME} && export ERKA_DEPLOY_ENV_K8S_NAME=${ERKA_STAGING_K8S_NAME} && export ERKA_DEPLOY_ENV_ZONE=${ERKA_STAGING_ZONE};                  
+                else
+                  echo "Environment variables is test!";
+                  export GCLOUD_ERKA_GCR_DEPLOY_ENV=${GCLOUD_API_KEYFILE_ERKA_GCR_TEST} && export GCLOUD_ERKA_K8S_DEPLOY_ENV=${GCLOUD_API_KEYFILE_ERKA_K8S_TEST};
+                  export ERKA_DEPLOY_ENV_PROJ_NAME=${ERKA_TEST_PROJ_NAME} && export ERKA_DEPLOY_ENV_K8S_NAME=${ERKA_TEST_K8S_NAME} && export ERKA_DEPLOY_ENV_ZONE=${ERKA_TEST_ZONE};
+              fi'
+          - docker load --input ./tmp-image.docker && echo ${GCLOUD_ERKA_GCR_DEPLOY_ENV} > /gcloud-api-key.json
+          - gcloud auth activate-service-account --key-file /gcloud-api-key.json && gcloud config set project ${ERKA_DEPLOY_ENV_PROJ_NAME}
+          - export IMAGE_TAG=${IMAGE_ARTIFACT_DOMAIN}/${ERKA_DEPLOY_ENV_PROJ_NAME}/${IMAGE_ARTIFACT_REPO}/${APP_NAME}:${BRANCH}.${BITBUCKET_BUILD_NUMBER}
+          - export LATEST_IMAGE=${IMAGE_ARTIFACT_DOMAIN}/${ERKA_DEPLOY_ENV_PROJ_NAME}/${IMAGE_ARTIFACT_REPO}/${APP_NAME}:latest
+          - cat /gcloud-api-key.json | docker login -u _json_key --password-stdin https://${IMAGE_ARTIFACT_DOMAIN}
+          - docker tag ${APP_NAME} ${IMAGE_TAG} && docker push ${IMAGE_TAG}
+          - 'if [[ $Deploy_Env == "production" ]]; then docker tag ${APP_NAME} ${LATEST_IMAGE} && docker push ${LATEST_IMAGE}; fi'
+          - echo ${GCLOUD_ERKA_K8S_DEPLOY_ENV} > /gcloud-api-k8s-key.json && gcloud auth activate-service-account --key-file /gcloud-api-k8s-key.json
+          - gcloud config set project ${ERKA_DEPLOY_ENV_PROJ_NAME}
+          - gcloud container clusters get-credentials ${ERKA_DEPLOY_ENV_K8S_NAME} --zone ${ERKA_DEPLOY_ENV_ZONE} --project ${ERKA_DEPLOY_ENV_PROJ_NAME}
+          - sed -i "s|$IMAGE_DOMAIN|$IMAGE_TAG|g" ${WORKING_PATH}/build/deploy.yaml && cat ${WORKING_PATH}/build/deploy.yaml && cat ${WORKING_PATH}/build/svc.yaml && cat ${WORKING_PATH}/build/hpa.yaml
+          - kubectl get pods
+          - kubectl apply -f ${WORKING_PATH}/build/deploy.yaml -f ${WORKING_PATH}/build/svc.yaml -f ${WORKING_PATH}/build/hpa.yaml
+        services:
+          - docker
+pipelines:
+  custom:
+    custom-deploy:
+      - variables:
+          - name: Deploy_Env
+            default: "test"
+            allowed-values:
+              - "test"
+              - "staging"
+              - "production"
+      - parallel: # these 4 steps will run in parallel
+          - step: *prepare-and-build
+      - parallel:
+          - step: *tag-push-deploy
+          - step: *sonarQube-python-analysis
