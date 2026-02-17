@@ -300,8 +300,3 @@ Below is a simplified flow diagram showing how data moves through the GraphMata 
 This architecture allows for fully decoupled, event-driven processing with each agent operating independently in its own thread, responding to events as they occur in the Redis messaging system.
 
 
-## License
-
-Copyright © 2025 Prometa AI. All rights reserved.
-
-This is proprietary software. Unauthorized copying or distribution is prohibited.
